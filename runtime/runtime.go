@@ -18,9 +18,12 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/Tarafagat/asterion-language/agcaspec"
+	"github.com/Tarafagat/asterion-plugin-contract/apc"
 
 	"github.com/Tarafagat/asterion-graph-cognitive-architecture/capability"
 	"github.com/Tarafagat/asterion-graph-cognitive-architecture/experience"
@@ -47,6 +50,23 @@ type Runtime struct {
 	Policies     []agcaspec.PolicyDecl
 	Bots         []agcaspec.BotDecl
 	RequiredCaps []agcaspec.CapabilityRequirement
+
+	// Secrets/Imports son globales al ARCHIVO, no por Intelligence (mismo
+	// criterio que el paper: `secret ...{}` vive afuera de cualquier
+	// bloque `intelligence{}` — ver Apéndice B) — Build copia el spec
+	// entero acá, sin filtrar por esta Intelligence.
+	Secrets []agcaspec.SecretDecl
+	Imports []agcaspec.ImportDecl
+
+	// DiscoveredCapabilities/DiscoveredSecrets son el resultado de leer
+	// de verdad el plugin.yaml de cada plugin que Imports trajo (con
+	// route local) — ver discoverImportedPlugins. Las capabilities con
+	// Resolved==true YA quedaron registradas en Capabilities; ninguna de
+	// las dos listas hace falta consultarla para que
+	// Capabilities.Match/RunCognitiveCycle funcionen — son para poder
+	// INSPECCIONAR qué se descubrió (y qué no, con el motivo).
+	DiscoveredCapabilities []DiscoveredCapability
+	DiscoveredSecrets      []DiscoveredSecret
 }
 
 // referenceLexicon es el léxico por defecto de la DeterministicNeuron de
@@ -128,8 +148,110 @@ func Build(spec *agcaspec.Spec, varName string) (*Runtime, error) {
 			rt.RequiredCaps = append(rt.RequiredCaps, c)
 		}
 	}
+	rt.Secrets = spec.Secrets
+	rt.Imports = spec.Imports
+	rt.DiscoveredCapabilities, rt.DiscoveredSecrets = discoverImportedPlugins(spec.Imports, rt.Capabilities)
 
 	return rt, nil
+}
+
+// DiscoveredCapability es un plugin traído por Import(...) cuyas
+// capabilities se intentó derivar de verdad — Resolved dice si se pudo
+// (y, si se pudo, quedó YA registrado en rt.Capabilities) o no (con el
+// motivo en Reason) — 'graph inspect' lo muestra tal cual, nunca
+// silenciado: un plugin de route remota sin clonar, o con un plugin.yaml
+// inválido, aparece igual, marcado como no resuelto.
+type DiscoveredCapability struct {
+	ImportVar    string
+	Plugin       string
+	Route        string
+	Resolved     bool
+	Reason       string // motivo si !Resolved
+	Capabilities []string
+}
+
+// DiscoveredSecret es un campo secreto que un plugin YA declaró en su
+// propio config_schema (secret: true) — descubierto automáticamente vía
+// Import(...), SIN que el archivo AGCA tenga que repetir esa
+// información con un AGCA.secret(from=, field=) manual. Ver el doc
+// comment de discoverImportedPlugins sobre cuándo SÍ conviene declarar
+// un AGCA.secret(...) explícito de todos modos (para nombrarlo/exponerlo
+// a un bot puntual) en vez de conformarse con este descubrimiento.
+type DiscoveredSecret struct {
+	ImportVar string
+	Plugin    string
+	Key       string
+	Label     string
+}
+
+// discoverImportedPlugins recorre cada Import(...) del archivo y, para
+// cada plugin cuya route sea una carpeta LOCAL (existe en disco — misma
+// heurística que resolveOrInstall en asterion-core: nunca asume que una
+// route con forma de URL de git ya está clonada), lee su plugin.yaml de
+// verdad UNA sola vez y deriva de ahí dos cosas distintas:
+//
+//   - sus capabilities (resources[].crud + actions[], ver
+//     capability.DeriveFromManifest) — se registran YA en caps, listas
+//     para que Neurons/Capabilities.Match las use en el próximo ciclo
+//     cognitivo, sin que el archivo AGCA tenga que declarar nada más;
+//   - sus campos de config marcados secret:true (config_schema) — se
+//     reportan como DiscoveredSecret, informativos: el plugin YA sabe
+//     que ese campo es secreto, no hace falta un AGCA.secret(from=,
+//     field=) manual solo para enterarse de que existe.
+//
+// Un AGCA.secret(from=, field=) explícito SIGUE teniendo sentido cuando
+// hace falta un NOMBRE propio de la Intelligence para ese secreto —
+// típicamente para listarlo en los permissions de un AGCA.bot(...) (ver
+// examples/agca-company.asterion) — nunca solo para repetir información
+// que este descubrimiento ya deja disponible.
+//
+// Una route de git (sin clonar) o un plugin.yaml inválido no son un
+// error fatal de Build: el plugin queda con Resolved=false (y sin
+// ningún DiscoveredSecret), con el motivo en Reason, para que 'graph
+// inspect' lo muestre honestamente en vez de que el runtime entero
+// falle por un plugin que este MVP todavía no sabe resolver.
+func discoverImportedPlugins(imports []agcaspec.ImportDecl, caps *capability.Registry) ([]DiscoveredCapability, []DiscoveredSecret) {
+	var discCaps []DiscoveredCapability
+	var discSecrets []DiscoveredSecret
+	for _, imp := range imports {
+		for _, pluginName := range imp.PluginNames {
+			route := imp.PluginRoutes[pluginName]
+			dc := DiscoveredCapability{ImportVar: imp.VarName, Plugin: pluginName, Route: route}
+
+			routeAbs := route
+			if !filepath.IsAbs(route) {
+				routeAbs = filepath.Join(imp.ResolvedDir, route)
+			}
+			info, statErr := os.Stat(routeAbs)
+			if statErr != nil || !info.IsDir() {
+				dc.Reason = fmt.Sprintf("route %q no es una carpeta local (¿todavía no se clonó? Import no clona git, solo lee plugin.yaml ya presente en disco)", route)
+				discCaps = append(discCaps, dc)
+				continue
+			}
+
+			manifest, err := apc.LoadManifest(routeAbs)
+			if err != nil {
+				dc.Reason = err.Error()
+				discCaps = append(discCaps, dc)
+				continue
+			}
+
+			provider := capability.DeriveFromManifest(pluginName, manifest)
+			caps.Register(provider)
+			dc.Resolved = true
+			dc.Capabilities = provider.Capabilities
+			discCaps = append(discCaps, dc)
+
+			for _, field := range manifest.ConfigSchema {
+				if field.Secret {
+					discSecrets = append(discSecrets, DiscoveredSecret{
+						ImportVar: imp.VarName, Plugin: pluginName, Key: field.Key, Label: field.Label,
+					})
+				}
+			}
+		}
+	}
+	return discCaps, discSecrets
 }
 
 func resolveIntelligence(spec *agcaspec.Spec, varName string) (agcaspec.IntelligenceDecl, error) {

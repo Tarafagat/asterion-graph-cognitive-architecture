@@ -4,19 +4,27 @@
 // Plugin compatible -> Política -> Ejecución."
 //
 // Estado real de este MVP, sin adornos: el Registry de acá abajo hace la
-// parte de "¿qué proveedor declara esta capacidad?" — el registro es
-// manual (Register), NO está conectado todavía al sistema real de
-// Asterion Plugins (asterion-core/internal/plugins), que expondría
-// capabilities de plugins de verdad instalados y corriendo. Esa conexión
-// es Milestone 7 del roadmap del paper ("Capability Registry conectado
-// al sistema de Plugins") y requiere que este repo hable con el proceso
-// de asterion-core (vía su cliente HTTP, mismo canal que ya usa
-// `asterion plugin system apply` para resolver plugins reales) — un paso
-// deliberadamente MÁS GRANDE que este esqueleto, y que no se simula acá:
-// Match() nunca inventa un proveedor que no fue Register()ado a mano.
+// parte de "¿qué proveedor declara esta capacidad?". Register es manual
+// (nadie lo llama solo) — pero DeriveFromManifest (ver más abajo) ya
+// deriva Providers REALES a partir del propio plugin.yaml de un plugin
+// (`resources[].crud` + `actions[]`, el mismo contrato que
+// `asterion plugin validate` ya valida), no un invento — es lo que
+// runtime.Build usa para poblar este Registry a partir de los plugins
+// que un Import(...) trajo con una route LOCAL (ver runtime/runtime.go).
+// Lo que sigue faltando de Milestone 7 del roadmap del paper
+// ("Capability Registry conectado al sistema de Plugins"): un plugin con
+// route de git sin clonar, o uno que no vino de ningún Import(...) —
+// ninguno de los dos se resuelve todavía; y no hay descubrimiento contra
+// procesos de plugin YA CORRIENDO en esta máquina (eso seguiría siendo
+// hablar con asterion-core, un paso más grande, no simulado acá).
 package capability
 
-import "sync"
+import (
+	"fmt"
+	"sync"
+
+	"github.com/Tarafagat/asterion-plugin-contract/apc"
+)
 
 // Provider es quién puede satisfacer una capability — hoy solo un
 // identificador (ej. el nombre de un plugin instalado, o "mock:database"
@@ -66,4 +74,48 @@ func (r *Registry) Match(cap string) []Provider {
 		}
 	}
 	return out
+}
+
+// DeriveFromManifest arma un Provider a partir de lo que un plugin YA
+// declaró en su propio plugin.yaml — nunca inventa nada nuevo:
+//
+//   - cada resources[].crud se traduce a "<resource.Name>.<op>" (ej. un
+//     resource "invoices" con crud [create, read, list] produce
+//     "invoices.create", "invoices.read", "invoices.list" — el mismo
+//     estilo <dominio>.<verbo> que usa el paper en sus propios ejemplos:
+//     "database.query", "inventory.read");
+//   - cada actions[] se traduce a su Name tal cual (ej. una action
+//     "issue_invoice" produce la capability "issue_invoice" — una action
+//     ya es una operación con nombre propio, no necesita el prefijo de
+//     un resource).
+//
+// Un plugin sin resources ni actions produce un Provider con
+// Capabilities vacío — nunca una inferida por otro lado.
+func DeriveFromManifest(pluginName string, m apc.Manifest) Provider {
+	var caps []string
+	for _, r := range m.Resources {
+		for _, op := range r.CRUD {
+			caps = append(caps, r.Name+"."+op)
+		}
+	}
+	for _, a := range m.Actions {
+		caps = append(caps, a.Name)
+	}
+	return Provider{Name: pluginName, Capabilities: caps}
+}
+
+// LoadProviderFromLocalPlugin lee plugin.yaml en dir — apc.LoadManifest
+// exige un manifiesto COMPLETO y válido (mismo chequeo que ya hace
+// `asterion plugin validate`, nunca una versión relajada solo para
+// leer capabilities) — y deriva sus capabilities con DeriveFromManifest.
+// Sirve para un plugin con route LOCAL (una carpeta que ya existe en
+// disco); uno con route de git sin clonar no tiene plugin.yaml que leer
+// todavía — ver runtime.Build, que es quien decide cuál es cuál antes de
+// llamar a esto.
+func LoadProviderFromLocalPlugin(pluginName, dir string) (Provider, error) {
+	m, err := apc.LoadManifest(dir)
+	if err != nil {
+		return Provider{}, fmt.Errorf("no pude leer el plugin.yaml de %q en %s: %w", pluginName, dir, err)
+	}
+	return DeriveFromManifest(pluginName, m), nil
 }

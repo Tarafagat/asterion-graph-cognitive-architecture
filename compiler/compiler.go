@@ -7,6 +7,7 @@ package compiler
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/Tarafagat/asterion-language/agcaspec"
 	langparser "github.com/Tarafagat/asterion-language/parser"
@@ -28,7 +29,10 @@ func CompileFile(path string) (*agcaspec.Spec, error) {
 		return nil, fmt.Errorf("%s no compila:\n%s", path, parseDiags.String())
 	}
 
-	spec, compileDiags := agcaspec.Compile(prog)
+	// baseDir: contra él se resuelve un Import(path=...) relativo dentro
+	// del archivo (ej. `Import(path="./sistema.asterion")` apunta al
+	// lado del propio archivo, no al cwd de quien corre 'asterion graph').
+	spec, compileDiags := agcaspec.Compile(prog, filepath.Dir(path))
 	if compileDiags.HasErrors() {
 		return nil, fmt.Errorf("%s no se pudo compilar a una inteligencia AGCA:\n%s", path, compileDiags.String())
 	}

@@ -22,7 +22,7 @@ func TestNew_RejectsBotFromDifferentIntelligence(t *testing.T) {
 	if diags.HasErrors() {
 		t.Fatalf("no parsea: %s", diags.String())
 	}
-	spec, diags := agcaspec.Compile(prog)
+	spec, diags := agcaspec.Compile(prog, "")
 	if diags.HasErrors() {
 		t.Fatalf("no compila: %s", diags.String())
 	}
