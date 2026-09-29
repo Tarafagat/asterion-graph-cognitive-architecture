@@ -20,15 +20,18 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/Tarafagat/asterion-language/agcaspec"
 	"github.com/Tarafagat/asterion-plugin-contract/apc"
 
 	"github.com/Tarafagat/asterion-graph-cognitive-architecture/capability"
+	"github.com/Tarafagat/asterion-graph-cognitive-architecture/cognition"
 	"github.com/Tarafagat/asterion-graph-cognitive-architecture/experience"
 	"github.com/Tarafagat/asterion-graph-cognitive-architecture/graph"
 	"github.com/Tarafagat/asterion-graph-cognitive-architecture/neuron"
+	"github.com/Tarafagat/asterion-graph-cognitive-architecture/tool"
 )
 
 // Runtime es una Intelligence AGCA ya materializada — un GraphDecl, un
@@ -49,6 +52,7 @@ type Runtime struct {
 	Memories     []agcaspec.MemoryDecl
 	Policies     []agcaspec.PolicyDecl
 	Bots         []agcaspec.BotDecl
+	RoleDecls    []agcaspec.RoleDecl
 	RequiredCaps []agcaspec.CapabilityRequirement
 
 	// Secrets/Imports son globales al ARCHIVO, no por Intelligence (mismo
@@ -67,6 +71,42 @@ type Runtime struct {
 	// INSPECCIONAR qué se descubrió (y qué no, con el motivo).
 	DiscoveredCapabilities []DiscoveredCapability
 	DiscoveredSecrets      []DiscoveredSecret
+
+	// --- Capa de Experience (Segundo Principio de AGI) -------------------
+	//
+	// Tools es el ÚNICO registro de capabilities ejecutables: lo que no
+	// está acá no se puede ejecutar, punto (ver package tool). Selector
+	// arma la Decision, Evaluator la juzga después de ejecutar, Learner
+	// convierte esa evaluación en un cambio de certeza, y Confidence
+	// guarda esa certeza POR CONTEXTO (nunca un número global por
+	// capability).
+	Tools       *tool.Registry
+	Selector    *cognition.Selector
+	Evaluator   cognition.Evaluator
+	Learner     cognition.Learner
+	Confidence  *cognition.ConfidenceStore
+	Decisions   cognition.DecisionStore
+	Experiences ExperienceSink
+
+	// Requirements verifica las precondiciones declaradas en un contrato
+	// (requires). nil significa que ningún requirement puede verificarse
+	// — y entonces un contrato que declare alguno NO se ejecuta.
+	Requirements tool.RequirementChecker
+
+	// isolatedHandlers marca qué capabilities de Tools con isolation
+	// fueron registradas confirmando que corren aisladas.
+	isolatedHandlers map[string]bool
+
+	// persist, cuando no es nil, es el FileStore que hace que decisiones,
+	// experiencias y certeza SOBREVIVAN entre corridas del CLI.
+	persist *cognition.FileStore
+}
+
+// ExperienceSink es lo que el runtime necesita de un store de
+// experiencias — separado de cognition.ExperienceStore para que el
+// runtime no dependa de los métodos de búsqueda, solo de poder guardar.
+type ExperienceSink interface {
+	SaveExperience(ctx context.Context, e cognition.Experience) error
 }
 
 // referenceLexicon es el léxico por defecto de la DeterministicNeuron de
@@ -89,12 +129,22 @@ func Build(spec *agcaspec.Spec, varName string) (*Runtime, error) {
 		return nil, err
 	}
 
+	confidence := cognition.NewConfidenceStore()
+	memory := cognition.NewMemoryStore()
 	rt := &Runtime{
-		Intelligence: intel,
-		Graph:        graph.NewStore(),
-		Neurons:      neuron.NewRegistry(),
-		Capabilities: capability.NewRegistry(),
-		Experience:   experience.NewStore(),
+		Intelligence:     intel,
+		Graph:            graph.NewStore(),
+		Neurons:          neuron.NewRegistry(),
+		Capabilities:     capability.NewRegistry(),
+		Experience:       experience.NewStore(),
+		Tools:            tool.NewRegistry(),
+		Confidence:       confidence,
+		Selector:         cognition.NewSelector(confidence),
+		Evaluator:        cognition.NewStandardEvaluator(),
+		Learner:          cognition.NewEMALearner(),
+		Decisions:        memory,
+		Experiences:      memory,
+		isolatedHandlers: map[string]bool{},
 	}
 
 	for _, g := range spec.Graphs {
@@ -143,11 +193,36 @@ func Build(spec *agcaspec.Spec, varName string) (*Runtime, error) {
 			rt.Bots = append(rt.Bots, b)
 		}
 	}
+	for _, r := range spec.Roles {
+		if r.Intelligence == intel.VarName {
+			rt.RoleDecls = append(rt.RoleDecls, r)
+		}
+	}
 	for _, c := range spec.Capabilities {
 		if c.Intelligence == intel.VarName {
 			rt.RequiredCaps = append(rt.RequiredCaps, c)
 		}
 	}
+	// Contratos de Tool declarados en el .asterion — se DECLARAN acá
+	// (visibles, puntuables) pero quedan sin handler hasta que alguien
+	// los ate con BindHandler: una capability declarada y no implementada
+	// nunca es ejecutable, y el runtime lo dice en vez de improvisar.
+	toolByVar := map[string]agcaspec.ToolDecl{}
+	for _, t := range spec.Tools {
+		toolByVar[t.VarName] = t
+	}
+	for _, c := range spec.ToolCaps {
+		owner := toolByVar[c.Tool]
+		if err := rt.Tools.Declare(tool.Contract{
+			ID: c.ID, Tool: owner.Name, Name: c.Name, Description: c.Description,
+			Category: owner.Category, Input: c.Input, Output: c.Output,
+			Effects: c.Effects, Requires: c.Requires, Guarantees: c.Guarantees,
+			Isolation: owner.Isolation,
+		}); err != nil {
+			return nil, fmt.Errorf("runtime: no pude declarar la capability %q: %w", c.ID, err)
+		}
+	}
+
 	rt.Secrets = spec.Secrets
 	rt.Imports = spec.Imports
 	rt.DiscoveredCapabilities, rt.DiscoveredSecrets = discoverImportedPlugins(spec.Imports, rt.Capabilities)
@@ -404,4 +479,71 @@ var traceCounter int64
 func newTraceID() string {
 	traceCounter++
 	return fmt.Sprintf("trace-%d-%d", time.Now().UnixNano(), traceCounter)
+}
+
+// BindHandler ata la implementación real de una capability YA declarada
+// en el .asterion. Es el único camino para que algo sea ejecutable: el
+// archivo declara el contrato, el código Go ata el handler, y AGCA solo
+// puede elegir entre los IDs que existan en ese cruce.
+//
+// isolated=true es la confirmación explícita de que ESTE handler corre
+// aislado — obligatorio para una capability de una Tool con
+// isolation declarada (ver tool.RequireIsolation): sin esa confirmación,
+// una capability de ejecución de código no se ejecuta, nunca hereda los
+// permisos del proceso host por omisión.
+func (rt *Runtime) BindHandler(capabilityID string, handler tool.Handler, isolated bool) error {
+	if err := rt.Tools.Bind(capabilityID, handler); err != nil {
+		return err
+	}
+	if isolated {
+		rt.isolatedHandlers[capabilityID] = true
+	}
+	return nil
+}
+
+// WithPersistence hace que decisiones, experiencias y certeza aprendida
+// SOBREVIVAN entre corridas — sin esto, cada invocación del CLI sería
+// amnésica y el Segundo Principio (la experiencia cambia decisiones
+// futuras) no podría cumplirse de una corrida a la otra. Carga lo que ya
+// hubiera guardado de antes.
+func (rt *Runtime) WithPersistence(dir string) error {
+	store, err := cognition.NewFileStore(dir)
+	if err != nil {
+		return err
+	}
+	if err := store.LoadConfidence(rt.Confidence); err != nil {
+		return err
+	}
+	rt.persist = store
+	rt.Decisions = store
+	rt.Experiences = store
+	return nil
+}
+
+// PersistenceDir devuelve dónde persiste, o "" si esta Intelligence corre
+// sin memoria entre corridas.
+func (rt *Runtime) PersistenceDir() string {
+	if rt.persist == nil {
+		return ""
+	}
+	return rt.persist.Dir()
+}
+
+// DefaultPersistenceDir es dónde vive la memoria de una Intelligence:
+// ~/.config/asterion/agca/<intelligence>/ — mismo criterio de ubicación
+// que el resto del estado local de Asterion.
+func DefaultPersistenceDir(intelligenceName string) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	safe := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			return r
+		default:
+			return '-'
+		}
+	}, intelligenceName)
+	return filepath.Join(home, ".config", "asterion", "agca", safe), nil
 }
