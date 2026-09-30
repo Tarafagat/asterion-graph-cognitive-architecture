@@ -318,7 +318,7 @@ func discoverImportedPlugins(imports []agcaspec.ImportDecl, caps *capability.Reg
 			discCaps = append(discCaps, dc)
 
 			for _, field := range manifest.ConfigSchema {
-				if field.Secret {
+				if field.IsSecret() {
 					discSecrets = append(discSecrets, DiscoveredSecret{
 						ImportVar: imp.VarName, Plugin: pluginName, Key: field.Key, Label: field.Label,
 					})
